@@ -159,6 +159,11 @@ def compute_entry_hash(entry: Dict[str, Any]) -> str:
     return hashlib.md5((entry_id + str(entry_time)).encode()).hexdigest()  # noqa: S324
 
 
+def get_unix_time(entry: Dict[str, Any]) -> Optional[int]:
+    entry_time = entry.get("published_parsed", entry.get("updated_parsed"))
+    return None if entry_time is None else calendar.timegm(entry_time)
+
+
 def unwrap_text(body: str) -> str:
     # Replace \n by space if it is preceded and followed by a non-\n.
     # Example: '\na\nb\nc\n\nd\n' -> '\na b c\n\nd\n'
@@ -218,29 +223,48 @@ for feed_url in feed_urls:
         old_feed_hashes = {}
 
     new_hashes: List[str] = []
+    unprocessed: List[Dict[str, Any]] = []
+    unprocessed_not_timestamped: Dict[str, Any] = []
     data = feedparser.parse(feed_url)
 
+    # Identify which entries are new, and enforce reverse chronological sorting on them.
     for entry in data.entries:
         entry_hash = compute_entry_hash(entry)
-        # An entry has either been published or updated.
-        entry_time: Optional[Tuple[int, int]] = entry.get(
-            "published_parsed", entry.get("updated_parsed")
-        )
-        if (
-            entry_time is not None
-            and time.time() - calendar.timegm(entry_time) > OLDNESS_THRESHOLD * 60 * 60 * 24
-        ):
-            # As a safeguard against misbehaving feeds, don't try to process
-            # entries older than some threshold.
-            continue
         if entry_hash in old_feed_hashes:
-            # We've already seen this. No need to process any older entries.
-            break
-        if not old_feed_hashes and len(new_hashes) >= 3:
-            # On a first run, pick up the 3 most recent entries. An RSS feed has
-            # entries in reverse chronological order.
-            break
+            # We have already logged this entry.
+            continue
 
+        entry_time = get_unix_time(entry)
+        if entry_time is None:
+            # The entry is new but does not have a timestamp, so cannot be sorted.
+            unprocessed_not_timestamped.append(entry)
+            continue
+        if time.time() - entry_time > OLDNESS_THRESHOLD * 60 * 60 * 24:
+            # RSS is designed for keeping up to date with a feed, not for archiving.
+            # As such we may disregard older entries.
+            continue
+
+        if (
+            not unprocessed
+            or entry_time <= get_unix_time(unprocessed[-1])
+        ):
+            # This is the oldest entry we have seen so far.
+            # All entries will end up in this case for feeds sorted in reverse
+            # chronological order.
+            unprocessed.append(entry)
+        else:
+            # This entry is not the oldest we have seen so far.
+            # The loop will always stop on the first index for feeds sorted in
+            # chronological order. It will only continue if the feed is out of order.
+            for i in range(len(unprocessed)):
+                if entry_time >= get_unix_time(unprocessed[i]):
+                    unprocessed.insert(i, entry)
+                    break
+
+    # Append any entries without timestamps
+    unprocessed += unprocessed_not_timestamped
+
+    for entry in unprocessed:
         feed_name: str = data.feed.title or feed_url
 
         response: Dict[str, Any] = send_zulip(entry, feed_name)
